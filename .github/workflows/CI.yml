@@ -1,0 +1,48 @@
+name: CI
+
+on:
+  push:
+    branches: [ master ]
+    tags: '*'
+  pull_request:
+
+jobs:
+  test:
+    name: Julia ${{ matrix.version }} - ${{ matrix.os }} - ${{ matrix.arch }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        version: [ '1.9' ]
+        os: [ macOS-latest ]
+        arch: [ x64 ]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: julia-actions/setup-julia@v1
+        with:
+          version: ${{ matrix.version }}
+          arch: ${{ matrix.arch }}
+
+      - name: Show Julia version
+        run: julia --version
+
+      - name: Instantiate
+        run: julia --project=. -e 'using Pkg; Pkg.instantiate()'
+
+      - name: Run tests (with coverage)
+        run: julia --project=. --code-coverage=all -e 'using Pkg; Pkg.test(; coverage=true)'
+
+      - name: Install Coverage.jl
+        run: julia --project=. -e 'using Pkg; Pkg.add(name="Coverage", version="1")'
+
+      - name: Generate lcov.info
+        run: julia --project=. -e 'using Coverage; LCOV.writefile("lcov.info", process_folder())'
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v5
+        with:
+          files: lcov.info
+          slug: sisl/RoombaPOMDPs.jl
+          token: ${{ secrets.CODECOV_TOKEN }}
+          fail_ci_if_error: true

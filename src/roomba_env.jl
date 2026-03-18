@@ -33,6 +33,58 @@ struct RoombaAct <: FieldVector{2, Float64}
     omega::Float64 # theta dot (rad/s)
 end
 
+"""
+Stochastic transition distribution for RoombaMDP.
+
+Models p(sp | s, a) via chain rule:
+  p(θ' | θ, ω)    ~ VonMises(θ + ω·dt, κ),  κ = 1/(theta_std · clamp(|ω|, 0.1, ω_max))²
+  p(step | v, θ') ~ TruncatedNormal(v·dt, σ, 0, wall_dist)
+
+where wall_dist = ray_length(room, p0, heading(θ')).
+Edge cases: v=0 → step_sigma=0 → deterministic step=0 (no movement).
+            om=0 → kappa clamped to finite value (no division by zero).
+"""
+struct BananaStateDistribution
+    theta_dist::VonMises{Float64}
+    step_mean::Float64    # v * dt
+    step_sigma::Float64   # trans_noise_coeff * v * dt; 0 when v=0
+    p0::SVec2
+    room::Room
+end
+
+sampletype(::Type{BananaStateDistribution}) = RoombaState
+
+function Random.rand(rng::AbstractRNG, d::BananaStateDistribution)
+    theta_s   = rand(rng, d.theta_dist)   # VonMises returns values in (-π, π]
+    heading   = SVec2(cos(theta_s), sin(theta_s))
+    wall_dist = ray_length(d.room, d.p0, heading)
+    if d.step_sigma > 0.0
+        step_dist = truncated(Normal(d.step_mean, d.step_sigma), 0.0, wall_dist)
+        des_step  = rand(rng, step_dist)
+    else
+        des_step = min(d.step_mean, wall_dist)
+    end
+    pos = d.p0 + des_step * heading
+    r = d.room
+    next_status = 1.0 * contact_wall(r.rectangles[r.goal_rect], r.goal_wall, pos) -
+                  1.0 * contact_wall(r.rectangles[r.stair_rect], r.stair_wall, pos)
+    return RoombaState(pos[1], pos[2], theta_s, next_status)
+end
+
+function Distributions.pdf(d::BananaStateDistribution, sp::RoombaState)
+    theta_p   = pdf(d.theta_dist, sp.theta)
+    heading   = SVec2(cos(sp.theta), sin(sp.theta))
+    wall_dist = ray_length(d.room, d.p0, heading)
+    step      = norm(SVec2(sp.x, sp.y) - d.p0)
+    if d.step_sigma > 0.0
+        step_dist = truncated(Normal(d.step_mean, d.step_sigma), 0.0, wall_dist)
+        step_p    = pdf(step_dist, step)
+    else
+        step_p = Float64(abs(step - d.step_mean) < 1e-10)
+    end
+    return theta_p * step_p
+end
+
 # action spaces
 struct RoombaActions end
 
@@ -60,6 +112,7 @@ Define the Roomba MDP.
 - `sspace::SS` environment state-space (ContinuousRoombaStateSpace or DiscreteRoombaStateSpace)
 - `aspace::AS` environment action-space struct
 """
+
 mutable struct RoombaMDP{SS, AS, S} <: MDP{S, RoombaAct}
     v_max::Float64
     om_max::Float64
@@ -69,6 +122,8 @@ mutable struct RoombaMDP{SS, AS, S} <: MDP{S, RoombaAct}
     goal_reward::Float64
     stairs_penalty::Float64
     discount::Float64
+    theta_std::Float64         # rotation noise for VonMises (0.0 = deterministic)
+    trans_noise_coeff::Float64 # translation noise coefficient (0.0 = deterministic)
     config::Int
     sspace::SS
     room::Room
@@ -77,10 +132,11 @@ mutable struct RoombaMDP{SS, AS, S} <: MDP{S, RoombaAct}
 end
 
 function RoombaMDP(;v_max=2.0, om_max=1.0, dt=0.5, contact_pen=-1.0, time_pen=-0.1, goal_reward=10.0, stairs_penalty=-10.0,
-                    discount=0.95, config=1, sspace::SS=ContinuousRoombaStateSpace(), room=Room(sspace, configuration=config),
+                    discount=0.95, theta_std=0.0, trans_noise_coeff=0.0,
+                    config=1, sspace::SS=ContinuousRoombaStateSpace(), room=Room(sspace, configuration=config),
                     aspace::AS=RoombaActions(), _amap=gen_amap(aspace)) where {SS, AS}
-        RoombaMDP{SS, AS, eltype(SS)}(v_max, om_max, dt, contact_pen, time_pen, goal_reward, stairs_penalty, discount, config,
-                                        sspace, room, aspace, _amap)
+        RoombaMDP{SS, AS, eltype(SS)}(v_max, om_max, dt, contact_pen, time_pen, goal_reward, stairs_penalty, discount,
+                                        theta_std, trans_noise_coeff, config, sspace, room, aspace, _amap)
 end
 
 # state-space definitions
@@ -241,8 +297,30 @@ end
 
 # transition Roomba state given curent state and action
 POMDPs.transition(m::RoombaPOMDP, s, a::RoombaAct) = transition(m.mdp, s, a)
-POMDPs.transition(m::RoombaMDP, s::RoombaState, a::RoombaAct) = Deterministic(get_next_state(m, s, a))
+function POMDPs.transition(m::RoombaMDP, s::RoombaState, a::RoombaAct)
+    next_s = get_next_state(m, s, a)
+    v      = clamp(a.v, 0.0, m.v_max)
+    om_abs = clamp(abs(a.omega), 0.1, m.om_max)  # clamp to [0.1, om_max] to keep kappa finite
+    kappa  = 1.0 / (m.theta_std * om_abs)^2
+    sigma  = m.trans_noise_coeff * v * m.dt
+    return BananaStateDistribution(
+        VonMises(next_s.theta, kappa),
+        v * m.dt,
+        sigma,
+        SVec2(s.x, s.y),
+        m.room
+    )
+end
+
 POMDPs.transition(m::RoombaMDP, s::Int, a::RoombaAct) = Deterministic(convert_s(Int, get_next_state(m, convert_s(RoombaState, s, m), a), m))
+
+# Explicit gen for efficiency (avoids constructing BananaStateDistribution when not needed for pdf)
+function POMDPs.gen(m::RoombaMDP, s::RoombaState, a::RoombaAct, rng::AbstractRNG)
+    sp = rand(rng, transition(m, s, a))
+    return (sp=sp, r=reward(m, s, a, sp))
+end
+
+POMDPs.gen(m::RoombaPOMDP, s::RoombaState, a::RoombaAct, rng::AbstractRNG) = gen(m.mdp, s, a, rng)
 
 function get_next_state(m::RoombaMDP, s::RoombaState, a::RoombaAct)
     v, om = a

@@ -18,6 +18,7 @@ export
     RoombaAct,
     RoombaMDP,
     RoombaPOMDP,
+    BananaStateDistribution,
     RoombaModel,
     Bumper,
     BumperPOMDP,

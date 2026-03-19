@@ -37,7 +37,7 @@ end
 Stochastic transition distribution for RoombaMDP.
 
 Models p(sp | s, a) via chain rule:
-  p(θ' | θ, ω)    ~ VonMises(θ + ω·dt, κ),  κ = 1/(theta_std · clamp(|ω|, 0.1, ω_max))²
+  p(θ' | θ, ω)    ~ VonMises(θ + ω·dt, κ),  κ = 1/(theta_std · clamp(|ω|, 0.01, ω_max))²
   p(step | v, θ') ~ TruncatedNormal(v·dt, σ, 0, wall_dist)
 
 where wall_dist = ray_length(room, p0, heading(θ')).
@@ -55,14 +55,14 @@ end
 sampletype(::Type{BananaStateDistribution}) = RoombaState
 
 function Random.rand(rng::AbstractRNG, d::BananaStateDistribution)
-    theta_s   = rand(rng, d.theta_dist)   # VonMises returns values in (-π, π]
-    heading   = SVec2(cos(theta_s), sin(theta_s))
-    wall_dist = ray_length(d.room, d.p0, heading)
+    theta_s            = rand(rng, d.theta_dist)   # VonMises returns values in (-π, π]
+    heading            = SVec2(cos(theta_s), sin(theta_s))
+    robot_dist_to_wall = max_safe_step(d.room, d.p0, heading)
     if d.step_sigma > 0.0
-        step_dist = truncated(Normal(d.step_mean, d.step_sigma), 0.0, wall_dist)
+        step_dist = truncated(Normal(d.step_mean, d.step_sigma), 0.0, robot_dist_to_wall)
         des_step  = rand(rng, step_dist)
     else
-        des_step = min(d.step_mean, wall_dist)
+        des_step = min(d.step_mean, robot_dist_to_wall)
     end
     pos = d.p0 + des_step * heading
     r = d.room
@@ -72,12 +72,12 @@ function Random.rand(rng::AbstractRNG, d::BananaStateDistribution)
 end
 
 function Distributions.pdf(d::BananaStateDistribution, sp::RoombaState)
-    theta_p   = pdf(d.theta_dist, sp.theta)
-    heading   = SVec2(cos(sp.theta), sin(sp.theta))
-    wall_dist = ray_length(d.room, d.p0, heading)
-    step      = norm(SVec2(sp.x, sp.y) - d.p0)
+    theta_p            = pdf(d.theta_dist, sp.theta)
+    heading            = SVec2(cos(sp.theta), sin(sp.theta))
+    robot_dist_to_wall = max_safe_step(d.room, d.p0, heading)
+    step               = norm(SVec2(sp.x, sp.y) - d.p0)
     if d.step_sigma > 0.0
-        step_dist = truncated(Normal(d.step_mean, d.step_sigma), 0.0, wall_dist)
+        step_dist = truncated(Normal(d.step_mean, d.step_sigma), 0.0, robot_dist_to_wall)
         step_p    = pdf(step_dist, step)
     else
         step_p = Float64(abs(step - d.step_mean) < 1e-10)
@@ -242,7 +242,7 @@ end
 
 POMDPs.obstype(::Type{DiscreteLidar}) = Int
 POMDPs.obstype(::DiscreteLidar) = Int
-DiscreteLidar(disc_points) = DiscreteLidar(Lidar().ray_stdev, disc_points, Vector{Float64}(length(disc_points)+1))
+DiscreteLidar(disc_points) = DiscreteLidar(Lid/home/ron/Information-driven-planning/SlipperyRoombaPOMDPs/src/roomba_env.jlar().ray_stdev, disc_points, Vector{Float64}(length(disc_points)+1))
 
 # Shorthands
 const RoombaModel{SS, AS} = Union{RoombaMDP{SS, AS}, RoombaPOMDP{SS, AS}}
@@ -300,7 +300,7 @@ POMDPs.transition(m::RoombaPOMDP, s, a::RoombaAct) = transition(m.mdp, s, a)
 function POMDPs.transition(m::RoombaMDP, s::RoombaState, a::RoombaAct)
     next_s = get_next_state(m, s, a)
     v      = clamp(a.v, 0.0, m.v_max)
-    om_abs = clamp(abs(a.omega), 0.1, m.om_max)  # clamp to [0.1, om_max] to keep kappa finite
+    om_abs = clamp(abs(a.omega), 0.01, m.om_max)  # clamp to [0.01, om_max] to keep kappa finite
     kappa  = 1.0 / (m.theta_std * om_abs)^2
     sigma  = m.trans_noise_coeff * v * m.dt
     return BananaStateDistribution(

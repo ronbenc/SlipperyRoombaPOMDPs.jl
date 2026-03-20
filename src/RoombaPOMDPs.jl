@@ -14,6 +14,11 @@ using ParticleFilters
 import POMDPTools: render
 
 export
+    MapLayout,
+    baseline,
+    one_sided_corridor,
+    two_sided_corridor,
+    Room,
     RoombaState,
     RoombaAct,
     RoombaMDP,

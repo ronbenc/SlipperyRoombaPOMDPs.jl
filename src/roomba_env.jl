@@ -133,7 +133,7 @@ end
 
 function RoombaMDP(;v_max=2.0, om_max=1.0, dt=0.5, contact_pen=-1.0, time_pen=-0.1, goal_reward=10.0, stairs_penalty=-10.0,
                     discount=0.95, theta_std=0.0, trans_noise_coeff=0.0,
-                    config=1, sspace::SS=ContinuousRoombaStateSpace(), room=Room(sspace, configuration=config),
+                    config=1, sspace::SS=ContinuousRoombaStateSpace(), room=Room(sspace, layout=baseline, config=config),
                     aspace::AS=RoombaActions(), _amap=gen_amap(aspace)) where {SS, AS}
         RoombaMDP{SS, AS, eltype(SS)}(v_max, om_max, dt, contact_pen, time_pen, goal_reward, stairs_penalty, discount,
                                         theta_std, trans_noise_coeff, config, sspace, room, aspace, _amap)

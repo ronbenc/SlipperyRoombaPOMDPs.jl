@@ -1,6 +1,8 @@
 # Code to define the environment room and rectangles used to define it
 # maintained by {jmorton2,kmenda}@stanford.edu
 
+@enum MapLayout baseline one_sided_corridor two_sided_corridor
+
 # Define constants  -- all units in m
 const RW = 5. # room width
 mutable struct ROBOT_W_struct
@@ -168,19 +170,95 @@ mutable struct Room
     stair_rect::Int # Index of rectangle with stairs
     stair_wall::Int # Index of wall that leads to stairs
 
-    function Room(sspace; configuration=1)
+    function Room(sspace; layout::MapLayout=baseline, config::Int=1, num_rooms::Int=4)
 
         retval = new()
 
-        # Define different configurations for stair and goal locations
+        # Initialize array of rectangles
+        rectangles = []
+
+        if layout == one_sided_corridor
+            wall_length = 10.0
+            for i in 1:num_rooms
+                corners = Float64[
+                    (i-1)*wall_length  0.0;
+                    (i-1)*wall_length  wall_length;
+                    i*wall_length      wall_length;
+                    i*wall_length      0.0
+                ]
+                goal_idx = (i == num_rooms) ? 3 : 0
+                push!(rectangles, Rectangle(corners, [true, true, true, false],
+                      goal_idx=goal_idx, stair_idx=0))
+            end
+            lower_corners = Float64[
+                0.0                   -wall_length;
+                0.0                    0.0;
+                num_rooms*wall_length  0.0;
+                num_rooms*wall_length -wall_length
+            ]
+            push!(rectangles, Rectangle(lower_corners, [true, false, true, true],
+                  goal_idx=0, stair_idx=3))
+            retval.goal_rect  = num_rooms
+            retval.goal_wall  = 3
+            retval.stair_rect = num_rooms + 1
+            retval.stair_wall = 3
+
+            retval.rectangles = rectangles
+            retval.areas = [r.area for r in rectangles]
+            return retval
+
+        elseif layout == two_sided_corridor
+            wall_length = 10.0
+            # n upper rooms, n-1 lower rooms: asymmetry enables localization
+            n_lower = num_rooms - 1
+            # Upper rooms (n): open bottom (connects to corridor)
+            for i in 1:num_rooms
+                goal_idx = (i == num_rooms) ? 3 : 0
+                push!(rectangles, Rectangle(Float64[
+                    (i-1)*wall_length  wall_length;
+                    (i-1)*wall_length  2*wall_length;
+                    i*wall_length      2*wall_length;
+                    i*wall_length      wall_length
+                ], [true, true, true, false], goal_idx=goal_idx, stair_idx=0))
+            end
+            # Lower rooms (n-1): same width W as top rooms, but two leftmost are merged into one 2W room
+            for i in 1:n_lower
+                x_start = (i == 1) ? 0.0           : i * wall_length
+                x_end   = (i == 1) ? 2*wall_length : (i + 1) * wall_length
+                stair_idx = (i == n_lower) ? 3 : 0
+                push!(rectangles, Rectangle(Float64[
+                    x_start  -wall_length;
+                    x_start   0.0;
+                    x_end     0.0;
+                    x_end    -wall_length
+                ], [true, false, true, true], goal_idx=0, stair_idx=stair_idx))
+            end
+            # Central corridor: spans full upper width, open top and bottom, end walls only
+            push!(rectangles, Rectangle(Float64[
+                0.0                    0.0;
+                0.0                    wall_length;
+                num_rooms*wall_length  wall_length;
+                num_rooms*wall_length  0.0
+            ], [true, false, true, false], goal_idx=0, stair_idx=0))
+            retval.goal_rect  = num_rooms           # last upper room
+            retval.goal_wall  = 3
+            retval.stair_rect = num_rooms + n_lower # last lower room
+            retval.stair_wall = 3
+
+            retval.rectangles = rectangles
+            retval.areas = [r.area for r in rectangles]
+            return retval
+        end
+
+        # Define different configurations for stair and goal locations (baseline)
         goal_idxs = [0, 0, 0, 0]
         stair_idxs = [0, 0, 0, 0]
-        if configuration == 2
+        if config == 2
             retval.goal_rect = 1
             retval.goal_wall = 4
             retval.stair_rect = 2
             retval.stair_wall = 1
-        elseif configuration == 3
+        elseif config == 3
             retval.goal_rect = 4
             retval.goal_wall = 3
             retval.stair_rect = 2
@@ -193,9 +271,6 @@ mutable struct Room
         end
         goal_idxs[retval.goal_rect] = retval.goal_wall
         stair_idxs[retval.stair_rect] = retval.stair_wall
-
-        # Initialize array of rectangles
-        rectangles = []
 
         # Rectangle 1
         corners = round_corners(sspace,[[-20-RW -20]; [-20-RW 0-RW]; [-20+RW 0-RW]; [-20+RW -20]])
@@ -301,6 +376,35 @@ function legal_translate(r::Room, pos0::SVec2, heading::SVec2, des_step::Float64
     else
         return pos1
     end
+end
+
+# Maximum step the robot center can take from pos0 in direction heading
+# before the robot body (radius ROBOT_W.val/2) contacts any wall.
+# Correctly handles wall corners by checking endpoint circles via furthest_step.
+# Returns 0.0 if the robot is already at or past a wall (e.g. due to noise).
+function max_safe_step(r::Room, pos0::SVec2, heading::SVec2)::Float64
+    R    = ROBOT_W.val / 2
+    # Build a far lookahead point to use as a direction filter (same logic as
+    # legal_translate). Segments where both pos0 and pos1 lie on the same side
+    # are behind or far outside the ray and must be skipped — otherwise
+    # furthest_step returns 0 for endpoints behind the robot (via clamped
+    # negative circle intersections), which would wrongly zero out max_safe_step.
+    pos1 = pos0 + 1000.0 * heading + R * sign.(heading)
+    fs   = Inf
+    for rect in r.rectangles
+        for seg in rect.segments
+            if (seg.p1[1] == seg.p2[1]) ?
+                (pos0[1] - seg.p1[1]) * (pos1[1] - seg.p2[1]) > 0 :
+                (pos0[2] - seg.p1[2]) * (pos1[2] - seg.p2[2]) > 0
+                continue
+            end
+            new_fs = furthest_step(seg, pos0, heading, R)
+            if new_fs < fs
+                fs = new_fs
+            end
+        end
+    end
+    return max(0.0, fs)
 end
 
 # computes the length of a ray from robot center to closest segment

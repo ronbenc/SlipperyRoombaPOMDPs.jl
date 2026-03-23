@@ -9,6 +9,7 @@ using Statistics
 using Graphics
 using Cairo
 using Random
+using LinearAlgebra
 using ParticleFilters
 
 import POMDPTools: render

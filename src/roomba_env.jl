@@ -38,16 +38,15 @@ Stochastic transition distribution for RoombaMDP.
 
 Models p(sp | s, a) via chain rule:
   p(θ' | θ, ω)    ~ VonMises(θ + ω·dt, κ),  κ = 1/(theta_std · clamp(|ω|, 0.01, ω_max))²
-  p(step | v, θ') ~ TruncatedNormal(v·dt, σ, 0, wall_dist)
+  p(step | v, θ') ~ censored(TruncatedNormal(v·dt, σ, 0, ∞), wall_dist)
 
 where wall_dist = ray_length(room, p0, heading(θ')).
-Edge cases: v=0 → step_sigma=0 → deterministic step=0 (no movement).
-            om=0 → kappa clamped to finite value (no division by zero).
+Assumes v > 0 and theta_std > 0. om=0 is handled by clamping to 0.01.
 """
 struct BananaStateDistribution
     theta_dist::VonMises{Float64}
     step_mean::Float64    # v * dt
-    step_sigma::Float64   # trans_noise_coeff * v * dt; 0 when v=0
+    step_sigma::Float64   # trans_noise_coeff * v * dt
     p0::SVec2
     room::Room
 end
@@ -58,12 +57,7 @@ function Random.rand(rng::AbstractRNG, d::BananaStateDistribution)
     theta_s            = rand(rng, d.theta_dist)   # VonMises returns values in (-π, π]
     heading            = SVec2(cos(theta_s), sin(theta_s))
     robot_dist_to_wall = max_safe_step(d.room, d.p0, heading)
-    if d.step_sigma > 0.0
-        step_dist = truncated(Normal(d.step_mean, d.step_sigma), 0.0, robot_dist_to_wall)
-        des_step  = rand(rng, step_dist)
-    else
-        des_step = min(d.step_mean, robot_dist_to_wall)
-    end
+    des_step = min(rand(rng, truncated(Normal(d.step_mean, d.step_sigma), 0.0, Inf)), robot_dist_to_wall)
     pos = d.p0 + des_step * heading
     r = d.room
     next_status = 1.0 * contact_wall(r.rectangles[r.goal_rect], r.goal_wall, pos) -
@@ -76,12 +70,9 @@ function Distributions.pdf(d::BananaStateDistribution, sp::RoombaState)
     heading            = SVec2(cos(sp.theta), sin(sp.theta))
     robot_dist_to_wall = max_safe_step(d.room, d.p0, heading)
     step               = norm(SVec2(sp.x, sp.y) - d.p0)
-    if d.step_sigma > 0.0
-        step_dist = truncated(Normal(d.step_mean, d.step_sigma), 0.0, robot_dist_to_wall)
-        step_p    = pdf(step_dist, step)
-    else
-        step_p = Float64(abs(step - d.step_mean) < 1e-10)
-    end
+    pre_contact_dist  = truncated(Normal(d.step_mean, d.step_sigma), 0.0, Inf)
+    step_p = step < robot_dist_to_wall - 1e-6 ? pdf(pre_contact_dist, step) :
+                                                 ccdf(pre_contact_dist, robot_dist_to_wall)
     return theta_p * step_p
 end
 
@@ -101,7 +92,7 @@ Define the Roomba MDP.
 
 # Fields
 - `v_max::Float64` maximum velocity of Roomba [m/s]
-- `om_max::Float64` maximum turn-rate of Roombda [rad/s]
+- `om_max::Float64` maximum turn-rate of Roomba [rad/s]
 - `dt::Float64` simulation time-step [s]
 - `contact_pen::Float64` penalty for wall-contact
 - `time_pen::Float64` penalty per time-step
@@ -122,8 +113,8 @@ mutable struct RoombaMDP{SS, AS, S} <: MDP{S, RoombaAct}
     goal_reward::Float64
     stairs_penalty::Float64
     discount::Float64
-    theta_std::Float64         # rotation noise for VonMises (0.0 = deterministic)
-    trans_noise_coeff::Float64 # translation noise coefficient (0.0 = deterministic)
+    theta_std::Float64         # rotation noise std for VonMises
+    trans_noise_coeff::Float64 # translation noise coefficient
     config::Int
     sspace::SS
     room::Room
@@ -132,7 +123,7 @@ mutable struct RoombaMDP{SS, AS, S} <: MDP{S, RoombaAct}
 end
 
 function RoombaMDP(;v_max=2.0, om_max=1.0, dt=0.5, contact_pen=-1.0, time_pen=-0.1, goal_reward=10.0, stairs_penalty=-10.0,
-                    discount=0.95, theta_std=0.0, trans_noise_coeff=0.0,
+                    discount=0.95, theta_std=0.1, trans_noise_coeff=0.1,
                     config=1, sspace::SS=ContinuousRoombaStateSpace(), room=Room(sspace, layout=baseline, config=config),
                     aspace::AS=RoombaActions(), _amap=gen_amap(aspace)) where {SS, AS}
         RoombaMDP{SS, AS, eltype(SS)}(v_max, om_max, dt, contact_pen, time_pen, goal_reward, stairs_penalty, discount,
@@ -210,8 +201,8 @@ end
 Define the Roomba POMDP
 
 Fields:
-- `sensor::T` struct specifying the sensor used (Lidar or Bump)
-- `mdp::T` underlying RoombaMDP
+- `sensor::T` struct specifying the sensor used (Lidar or Bumper)
+- `mdp::RoombaMDP` underlying RoombaMDP
 """
 struct RoombaPOMDP{SS, AS, S, T, O} <: POMDP{S, RoombaAct, O}
     sensor::T
@@ -295,7 +286,7 @@ function get_goal_xy(m::RoombaModel)
     end
 end
 
-# transition Roomba state given curent state and action
+# transition Roomba state given current state and action
 POMDPs.transition(m::RoombaPOMDP, s, a::RoombaAct) = transition(m.mdp, s, a)
 function POMDPs.transition(m::RoombaMDP, s::RoombaState, a::RoombaAct)
     next_s = get_next_state(m, s, a)
@@ -314,7 +305,6 @@ end
 
 POMDPs.transition(m::RoombaMDP, s::Int, a::RoombaAct) = Deterministic(convert_s(Int, get_next_state(m, convert_s(RoombaState, s, m), a), m))
 
-# Explicit gen for efficiency (avoids constructing BananaStateDistribution when not needed for pdf)
 function POMDPs.gen(m::RoombaMDP, s::RoombaState, a::RoombaAct, rng::AbstractRNG)
     sp = rand(rng, transition(m, s, a))
     return (sp=sp, r=reward(m, s, a, sp))
@@ -520,6 +510,10 @@ function render(ctx::CairoContext, m::RoombaModel, step)
     state = step[:sp]
 
     radius = ROBOT_W.val*6
+
+    # white background
+    set_source_rgb(ctx, 1, 1, 1)
+    paint(ctx)
 
     # render particle filter belief
     if haskey(step, :bp)
